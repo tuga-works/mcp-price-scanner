@@ -1,0 +1,32 @@
+# Secrets and operator-specific configuration: never commit these.
+.env
+.env.*
+!.env.example
+config/sources.yaml
+config/*.local.yaml
+*.local.yaml
+*.session
+*.cookies
+cookies*.json
+storage_state*.json
+profile/
+profiles/
+auth/
+.playwright/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

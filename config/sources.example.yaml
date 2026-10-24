@@ -1,0 +1,253 @@
+# Source configuration for MCP Price Scanner.
+#
+# Copy this file to config/sources.yaml (which git ignores) and enable only the
+# sources you need. Your copy is yours: it never goes into the repository.
+#
+# A plain HTML source needs no code: give it a search URL and CSS selectors.
+#
+#   search.url placeholders: {query} (percent-encoded), {query_plus} (spaces
+#   as +), {query_slug} (lowercase, words joined by -).
+#   search.sort maps newest / relevance / price_asc / price_desc to a query
+#   string fragment appended to the URL. Unlisted orders are not applied.
+#   search.item is the CSS selector of one result card; search.fields says
+#   how to read each field inside a card. A field is either a CSS selector
+#   string (its text is used) or a mapping:
+#       selector:      CSS selector inside the card (omit = the card itself)
+#       attr:          read this attribute instead of the text
+#       label:         take the match whose text starts with this label, minus the label
+#       regex:         keep regex group 1 (or the whole match)
+#       value:         a constant
+#       unreliable_if: (date only) regex; when it matches, the shown date is
+#                      not a posting date and the listing gets posted_date: null
+#   Fields: id, title, url, price, currency, location, date, condition, snippet.
+#   title and url are required; everything else is null when not found.
+#
+#   listing.fields reads a single listing page the same way. schema.org
+#   Product JSON-LD on the page fills any field the selectors do not.
+#
+#   dates_reliable (search and listing) says whether the dates this source
+#   shows are real posting dates. Relative ages ("2 days ago") are never
+#   reported as reliable.
+#
+#   parser: <name> hands the page to a named module in price_scanner/parsers/
+#   for sites that CSS selectors cannot describe (see facebook-marketplace).
+#
+# Politeness settings (defaults below, overridable per source):
+# min/max_delay_seconds between two requests to the same site (never below
+# 1 s), cooldown_seconds after a block (403, 429, challenge page, CAPTCHA).
+
+defaults:
+  min_delay_seconds: 2
+  max_delay_seconds: 5
+  cooldown_seconds: 3600
+  timeout_seconds: 30
+  max_results: 50
+  timezone: Europe/Warsaw
+  block_markers: []
+  flags:
+    # Surface replica / counterfeit markings the listing itself shows.
+    - name: replica
+      pattern: '\brepli[kc]\w*|\bpodr[oó]b\w*|\bimitacj\w*|\bfake\b'
+      fields: [title, snippet, condition]
+
+sources:
+  olx:
+    name: OLX (Poland)
+    enabled: true
+    base_url: https://www.olx.pl/
+    domains: [olx.pl]
+    default_currency: PLN
+    notes: Peer-to-peer classifieds. Cards marked "refreshed" carry no posting date.
+    search:
+      url: https://www.olx.pl/oferty/q-{query_slug}/
+      sort:
+        newest: search%5Border%5D=created_at%3Adesc
+        relevance: search%5Border%5D=relevance%3Adesc
+        price_asc: search%5Border%5D=filter_float_price%3Aasc
+        price_desc: search%5Border%5D=filter_float_price%3Adesc
+      item: '[data-testid="l-card"]'
+      wait_for: '[data-testid="l-card"]'
+      dates_reliable: true
+      fields:
+        id: {attr: id}
+        title: '[data-testid="card-title-link"]'
+        url: {selector: '[data-testid="card-title-link"]', attr: href}
+        price: '[data-testid="ad-price"]'
+        location: {selector: '[data-testid="location-date"]', regex: '^(.*?)\s+-\s+'}
+        date:
+          selector: '[data-testid="location-date"]'
+          regex: '\s-\s+(.*)$'
+          unreliable_if: 'od[sś]wie[zż]ono'
+        condition: {selector: '[data-nx-name="NexusBadge"]', regex: '^(Nowe|Używane|Uszkodzone)$'}
+    listing:
+      wait_for: '[data-testid="offer_title"]'
+      dates_reliable: true
+      fields:
+        title: '[data-testid="offer_title"]'
+        price: '[data-testid="ad-price-container"]'
+        location: {selector: '[data-testid="map-aside-section"]', regex: '^(?:Lokalizacja\s*)?(.*)$'}
+        date:
+          selector: '[data-testid="ad-posted-at"]'
+          regex: '^(?:Dodane\s*)?(.*)$'
+          unreliable_if: 'od[sś]wie[zż]ono'
+        condition: {selector: '[data-testid="ad-parameters-container"] p', label: 'Stan:'}
+        snippet: {selector: '[data-testid="ad_description"]', regex: '^(?:Opis\s*)?(.*)$'}
+
+  allegro:
+    name: Allegro
+    enabled: true
+    base_url: https://allegro.pl/
+    domains: [allegro.pl]
+    default_currency: PLN
+    id_pattern: '-(\d{8,})(?:[?#]|$)'
+    notes: >-
+      Large marketplace behind DataDome. Often blocked even from residential
+      connections with a headless browser; then it reports "blocked".
+      Selectors are best effort and were not verifiable while blocked.
+      Allegro shows no posting dates.
+    search:
+      url: https://allegro.pl/listing?string={query_plus}
+      sort:
+        newest: order=n
+        relevance: order=m
+        price_asc: order=p
+        price_desc: order=pd
+      item: 'article'
+      wait_for: 'article'
+      dates_reliable: false
+      fields:
+        title: 'h2 a'
+        url: {selector: 'h2 a', attr: href}
+        price: {selector: '[aria-label*="cena"]', attr: aria-label}
+        condition: {selector: 'dd', regex: '^(Nowy|Używany|Uszkodzony|Odnowiony.*)$'}
+    listing:
+      dates_reliable: false
+      fields:
+        title: 'h1'
+
+  allegro-lokalnie:
+    name: Allegro Lokalnie
+    enabled: true
+    base_url: https://allegrolokalnie.pl/
+    domains: [allegrolokalnie.pl]
+    default_currency: PLN
+    notes: Classifieds side of Allegro. Neither cards nor listing pages show a posting date.
+    search:
+      url: https://allegrolokalnie.pl/oferty/q/{query}
+      sort:
+        newest: sort=startingTime-desc
+        price_asc: sort=price-asc
+        price_desc: sort=price-desc
+      item: 'article.mlc-itembox__container'
+      wait_for: 'article.mlc-itembox__container'
+      dates_reliable: false
+      fields:
+        title: 'h3.mlc-itembox__title'
+        url: {selector: 'a.mlc-itembox', attr: href}
+        price: '.ml-offer-price'
+        location: 'address'
+        snippet: '.mlc-itembox__params'
+    listing:
+      dates_reliable: false
+      fields:
+        title: 'h1'
+        price: {selector: '[itemprop="price"]', attr: content}
+        currency: {selector: '[itemprop="priceCurrency"]', attr: content}
+        location: 'address'
+        condition: {selector: '[data-testid="params-list"]', regex: 'Stan\s+(Nowy|Bardzo dobry|Dobry|Używany|Uszkodzony|\S+)'}
+        snippet: '.mlc-offer__description'
+
+  vinted:
+    name: Vinted (Poland)
+    enabled: true
+    base_url: https://www.vinted.pl/
+    domains: [vinted.pl]
+    default_currency: PLN
+    id_pattern: '/items/(\d+)'
+    notes: >-
+      Second-hand marketplace. Prices are the item price without the buyer
+      fee. Cards show no date; listing pages show a relative upload age only,
+      reported as unreliable.
+    search:
+      url: https://www.vinted.pl/catalog?search_text={query}
+      sort:
+        newest: order=newest_first
+        relevance: order=relevance
+        price_asc: order=price_low_to_high
+        price_desc: order=price_high_to_low
+      item: '[data-testid="grid-item"]'
+      wait_for: '[data-testid="grid-item"]'
+      dates_reliable: false
+      fields:
+        title:
+          selector: 'a[data-testid$="--overlay-link"]'
+          attr: title
+          regex: '^(.*?),\s+(?:Marka|Stan|Rozmiar|Model):'
+        url: {selector: 'a[data-testid$="--overlay-link"]', attr: href}
+        price: '[data-testid$="--price-text"]'
+        condition: '[data-testid$="--description-subtitle"]'
+    listing:
+      wait_for: '[data-testid="item-price"]'
+      dates_reliable: false
+      fields:
+        price: '[data-testid="item-price"]'
+        condition: {selector: '[data-testid="item-attributes-status"]', regex: '^(?:Stan\s*)?(.*)$'}
+        date: {selector: '[data-testid="item-attributes-upload_date"]', regex: '^(?:Dodane\s*)?(.*)$'}
+
+  facebook-marketplace:
+    name: Facebook Marketplace
+    enabled: false
+    login_required: true
+    base_url: https://www.facebook.com/marketplace/
+    domains: [facebook.com]
+    parser: facebook
+    block_resources: false
+    login_url_patterns: ['^/login', '/checkpoint/']
+    notes: >-
+      Login-gated. Disabled by default. Enabling it needs a browser profile
+      created by hand on the bridge host (PRICE_SCANNER_PROFILE_DIR) with a
+      dedicated account for automated reads, never a personal main account.
+    search:
+      url: https://www.facebook.com/marketplace/search/?query={query}
+      sort:
+        newest: sortBy=creation_time_descend
+        price_asc: sortBy=price_ascend
+        price_desc: sortBy=price_descend
+      wait_for: 'a[href*="/marketplace/item/"]'
+      dates_reliable: false
+    listing:
+      dates_reliable: false
+      fields:
+        title: 'h1'
+
+  loombard:
+    name: Loombard (pawnshop retail)
+    enabled: true
+    base_url: https://www.loombard.pl/
+    domains: [loombard.pl]
+    default_currency: PLN
+    id_pattern: '/products/([^/?#]+)'
+    notes: >-
+      Pawnshop retail chain: branch stock at retail-style prices. Location is
+      the branch. Replica markings shown on a listing are surfaced in flags.
+      No posting dates are shown.
+    search:
+      url: https://www.loombard.pl/categories?searchQuery={query_plus}
+      sort:
+        newest: sort=c
+        price_asc: sort=p
+        price_desc: sort=pr
+      item: '.product-item'
+      wait_for: '.product-item'
+      dates_reliable: false
+      fields:
+        title: '.product-title a'
+        url: {selector: '.product-title a', attr: href}
+        price: '.product-value'
+        location: {selector: 'p.product-desc', label: 'Lokalizacja:'}
+        condition: {selector: 'p.product-desc', label: 'Stan:'}
+    listing:
+      dates_reliable: false
+      fields:
+        title: 'h1'
+        location: {selector: '.product-merchant p.param', label: 'Lokalizacja:'}

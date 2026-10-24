@@ -1,0 +1,40 @@
+# systemd unit for MCP Price Scanner.
+#
+# Layout assumed (see README "Install"): service user `price-scanner` with
+# home /opt/price-scanner, the repository cloned to
+# /opt/price-scanner/mcp-price-scanner and a virtualenv at
+# /opt/price-scanner/venv. Adjust the paths if you use another layout.
+#
+# Install: sudo cp systemd/price-scanner.service /etc/systemd/system/
+#          sudo systemctl daemon-reload
+#          sudo systemctl enable --now price-scanner
+
+[Unit]
+Description=MCP Price Scanner (read-only marketplace bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=price-scanner
+Group=price-scanner
+WorkingDirectory=/opt/price-scanner/mcp-price-scanner
+# Operator-owned file with PRICE_SCANNER_TOKEN and other settings (mode 600).
+EnvironmentFile=/opt/price-scanner/mcp-price-scanner/.env
+ExecStart=/opt/price-scanner/venv/bin/price-scanner
+Restart=on-failure
+RestartSec=10
+# Logs go to stdout, i.e. the journal: journalctl -u price-scanner
+StandardOutput=journal
+StandardError=journal
+
+# Hardening. The process needs no privileges and writes only to /tmp and the
+# browser cache in its home directory.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
