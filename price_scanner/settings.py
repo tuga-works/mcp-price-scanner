@@ -14,6 +14,9 @@ from pathlib import Path
 
 PLACEHOLDER_TOKENS = {"", "change-me-at-install", "change-me", "changeme"}
 MIN_TOKEN_LENGTH = 32
+DEFAULT_DB_PATH = "data/price-scanner.db"
+DEFAULT_SEARCH_CACHE_TTL_SECONDS = 6 * 3600
+DEFAULT_FETCH_CACHE_TTL_SECONDS = 24 * 3600
 
 
 class SettingsError(RuntimeError):
@@ -49,6 +52,20 @@ def _bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _seconds(name: str, default: int) -> int:
+    """A non-negative whole number of seconds; a bad value is a start-up error."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SettingsError(f"{name} must be a whole number of seconds, got {raw!r}") from None
+    if value < 0:
+        raise SettingsError(f"{name} must not be negative")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     token: str = field(repr=False)
@@ -60,6 +77,9 @@ class Settings:
     log_level: str = "INFO"
     cache_ttl_seconds: int = 300
     allowed_hosts: tuple[str, ...] = ()
+    db_path: Path = Path(DEFAULT_DB_PATH)
+    search_cache_ttl_seconds: int = DEFAULT_SEARCH_CACHE_TTL_SECONDS
+    fetch_cache_ttl_seconds: int = DEFAULT_FETCH_CACHE_TTL_SECONDS
 
     @classmethod
     def from_env(cls, *, require_token: bool = True) -> "Settings":
@@ -80,6 +100,7 @@ class Settings:
 
         profile = os.environ.get("PRICE_SCANNER_PROFILE_DIR", "").strip()
         allowed = os.environ.get("PRICE_SCANNER_ALLOWED_HOSTS", "")
+        db_path = os.environ.get("PRICE_SCANNER_DB_PATH", "").strip() or DEFAULT_DB_PATH
         return cls(
             token=token,
             host=os.environ.get("PRICE_SCANNER_HOST", "127.0.0.1").strip() or "127.0.0.1",
@@ -88,6 +109,11 @@ class Settings:
             profile_dir=Path(profile).expanduser() if profile else None,
             headless=_bool(os.environ.get("PRICE_SCANNER_HEADLESS"), True),
             log_level=os.environ.get("PRICE_SCANNER_LOG_LEVEL", "INFO").upper(),
-            cache_ttl_seconds=int(os.environ.get("PRICE_SCANNER_CACHE_TTL_SECONDS", "300")),
+            cache_ttl_seconds=_seconds("PRICE_SCANNER_CACHE_TTL_SECONDS", 300),
             allowed_hosts=tuple(h.strip() for h in allowed.split(",") if h.strip()),
+            db_path=Path(db_path).expanduser(),
+            search_cache_ttl_seconds=_seconds("PRICE_SCANNER_SEARCH_CACHE_TTL_SECONDS",
+                                              DEFAULT_SEARCH_CACHE_TTL_SECONDS),
+            fetch_cache_ttl_seconds=_seconds("PRICE_SCANNER_FETCH_CACHE_TTL_SECONDS",
+                                             DEFAULT_FETCH_CACHE_TTL_SECONDS),
         )

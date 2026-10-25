@@ -2,8 +2,9 @@
 #
 # Layout assumed (see README "Install"): service user `price-scanner` with
 # home /opt/price-scanner, the repository cloned to
-# /opt/price-scanner/mcp-price-scanner and a virtualenv at
-# /opt/price-scanner/venv. Adjust the paths if you use another layout.
+# /opt/price-scanner/mcp-price-scanner, a virtualenv at
+# /opt/price-scanner/venv and the persistent store (SQLite) under
+# /opt/price-scanner/data/. Adjust the paths if you use another layout.
 #
 # Install: sudo cp systemd/price-scanner.service /etc/systemd/system/
 #          sudo systemctl daemon-reload
@@ -19,6 +20,8 @@ Type=simple
 User=price-scanner
 Group=price-scanner
 WorkingDirectory=/opt/price-scanner/mcp-price-scanner
+# Persistent store, outside the repository. A value in the .env file wins.
+Environment=PRICE_SCANNER_DB_PATH=/opt/price-scanner/data/price-scanner.db
 # Operator-owned file with PRICE_SCANNER_TOKEN and other settings (mode 600).
 EnvironmentFile=/opt/price-scanner/mcp-price-scanner/.env
 ExecStart=/opt/price-scanner/venv/bin/price-scanner
@@ -28,8 +31,8 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# Hardening. The process needs no privileges and writes only to /tmp and the
-# browser cache in its home directory.
+# Hardening. The process needs no privileges and writes only to /tmp, the
+# browser cache in its home directory and the persistent store.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full

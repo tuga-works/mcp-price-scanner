@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-price-scanner"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-hosted, read-only MCP bridge that fetches public marketplace listings with a real browser from a residential connection."
 readme = "README.md"
 requires-python = ">=3.12"

@@ -7,6 +7,7 @@ import pytest
 from price_scanner.egress import EgressGuard
 from price_scanner.service import PriceScanner
 from price_scanner.sources import SourcesConfig
+from price_scanner.store import Store
 from price_scanner.urlsafety import UnsafeURL, address_allowed, host_matches, sanitize_listing_url
 from tests.conftest import EXAMPLE_SOURCES, fixture_html
 from tests.test_service import FakeFetcher
@@ -85,21 +86,24 @@ class RedirectingFetcher(FakeFetcher):
         return 200, "https://elsewhere.example/landing", fixture_html("listing_jsonld_nodate.html")
 
 
-async def test_redirect_off_domain_is_discarded_and_not_cached():
+async def test_redirect_off_domain_is_discarded_and_not_cached(tmp_path):
     config = SourcesConfig.model_validate(EXAMPLE_SOURCES)
-    fetcher = RedirectingFetcher(config, {})
-    scanner = PriceScanner(config, fetcher)
+    store = Store(tmp_path / "ps.db")
+    fetcher = RedirectingFetcher(config, {}, store)
+    scanner = PriceScanner(config, fetcher, store=store)
     out = await scanner.fetch_listing("https://market.example/item/old-radio-1003.html")
     assert out["status"] == "error" and out["reason"] == "redirected_off_source"
     assert "listing" not in out
     out = await scanner.fetch_listing("https://market.example/item/old-radio-1003.html")
-    assert len(fetcher.requests) == 2  # nothing was cached
+    assert len(fetcher.requests) == 2  # nothing was cached, in memory or in the store
+    assert store.status()["responses"] == 0
 
 
-async def test_fetch_listing_rejects_bypass_without_request():
+async def test_fetch_listing_rejects_bypass_without_request(tmp_path):
     config = SourcesConfig.model_validate(EXAMPLE_SOURCES)
-    fetcher = FakeFetcher(config, {})
-    scanner = PriceScanner(config, fetcher)
+    store = Store(tmp_path / "ps.db")
+    fetcher = FakeFetcher(config, {}, store)
+    scanner = PriceScanner(config, fetcher, store=store)
     for url in ["https://evil.example\\@market.example/x", "https://user@market.example/x",
                 "https://127.0.0.1/x", "https://market.example.evil.example/x"]:
         assert (await scanner.fetch_listing(url))["status"] == "error"

@@ -9,7 +9,10 @@ Politeness rules, enforced here for every request:
   starts a cooldown (default one hour) during which no request is sent;
 - the browser is a normal, current Chromium with its default user agent; no
   user-agent rotation, no fingerprint changes, no CAPTCHA solving;
-- fetched pages are cached in memory for a few minutes only.
+- fetched pages are cached in memory for a few minutes as a fast path; the
+  persistent store (:mod:`price_scanner.store`) in front of this module keeps
+  responses and cooldowns across restarts, and a cooldown started here is
+  written to it, so a restart cannot lift a block.
 
 SSRF protection: every request (navigations, redirect hops, subresources)
 leaves through :class:`~price_scanner.egress.EgressGuard`, which only tunnels
@@ -26,14 +29,14 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from price_scanner.blocking import Verdict, classify
 from price_scanner.egress import EgressGuard
-from price_scanner.schema import utc_now_iso
 from price_scanner.sources import Source, SourcesConfig
+from price_scanner.store import Store
 from price_scanner.urlsafety import address_allowed, host_matches, is_ip_literal, normalize_host
 
 log = logging.getLogger(__name__)
@@ -42,6 +45,10 @@ WAIT_FOR_TIMEOUT_MS = 10_000
 CACHE_MAX_ENTRIES = 256
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 _NET_ERROR_RE = re.compile(r"net::(ERR_[A-Z_]+)")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _host(url: str) -> str:
@@ -88,6 +95,7 @@ class FetchResult:
     verdict: Verdict
     from_cache: bool = False
     retry_after_seconds: int | None = None
+    fetched_at: str | None = None  # UTC ISO time of the live fetch (kept on in-memory cache hits)
 
 
 @dataclass
@@ -114,8 +122,11 @@ class SiteState:
 
 class Fetcher:
     def __init__(self, config: SourcesConfig, *, headless: bool = True, profile_dir: Path | None = None,
-                 cache_ttl_seconds: int = 300) -> None:
+                 cache_ttl_seconds: int = 300, store: Store | None = None,
+                 clock: Callable[[], datetime] | None = None) -> None:
         self.config = config
+        self.store = store
+        self._now = clock or _utc_now
         self.headless = headless
         self.profile_dir = profile_dir
         self.cache_ttl = max(0, cache_ttl_seconds)
@@ -142,7 +153,7 @@ class Fetcher:
 
     def _remember(self, source: Source, verdict: Verdict) -> None:
         st = self.state(source.key)
-        st.last_checked = utc_now_iso()
+        st.last_checked = self._now().isoformat()
         st.last_reason = verdict.reason
         st.last_state = {
             "ok": "reachable",
@@ -153,12 +164,42 @@ class Fetcher:
     def _start_cooldown(self, source: Source, reason: str | None) -> int:
         timing = self.config.timing(source)
         st = self.state(source.key)
+        until = self._now() + timedelta(seconds=timing.cooldown)
         st.blocked_until = time.monotonic() + timing.cooldown
-        st.blocked_until_wall = datetime.fromtimestamp(time.time() + timing.cooldown, timezone.utc).replace(
-            microsecond=0).isoformat()
+        st.blocked_until_wall = until.isoformat()
         st.block_reason = reason
         log.warning("source %s blocked (%s); cooling down for %ss", source.key, reason, timing.cooldown)
+        if self.store is not None:
+            # Persisted, so a restart cannot lift the block. A failed write is
+            # logged and counted by the store; the in-memory cooldown still holds.
+            self.store.put_cooldown(source.key, reason, until, timing.cooldown)
         return timing.cooldown
+
+    def restore_cooldowns(self) -> int:
+        """Load the not-yet-expired cooldowns from the store (at startup).
+
+        Returns how many were restored. Raises :class:`~price_scanner.store.StoreError`
+        when the store cannot be read; the caller then fails closed.
+        """
+        if self.store is None:
+            return 0
+        now = self._now()
+        restored = 0
+        for cd in self.store.active_cooldowns():
+            remaining = (cd.blocked_until - now).total_seconds()
+            if remaining <= 0 or cd.source not in self.config.sources:
+                continue
+            st = self.state(cd.source)
+            st.blocked_until = time.monotonic() + remaining
+            st.blocked_until_wall = cd.blocked_until.isoformat()
+            st.block_reason = cd.reason
+            st.last_state = "blocked"
+            st.last_reason = cd.reason
+            st.last_checked = (cd.blocked_until - timedelta(seconds=cd.retry_after_seconds)).isoformat()
+            log.warning("source %s: cooldown restored from the store (%s), %ds remaining",
+                        cd.source, cd.reason, int(remaining))
+            restored += 1
+        return restored
 
     # -- cache ---------------------------------------------------------------
 
@@ -232,7 +273,7 @@ class Fetcher:
 
             verdict = classify(status, final_url, html, extra_markers=self.config.defaults.block_markers
                                + source.block_markers, login_url_patterns=source.login_url_patterns)
-            result = FetchResult(url, final_url, status, html, verdict)
+            result = FetchResult(url, final_url, status, html, verdict, fetched_at=self._now().isoformat())
             if verdict.state == "blocked":
                 result.retry_after_seconds = self._start_cooldown(source, verdict.reason)
             elif verdict.state == "ok":

@@ -26,22 +26,144 @@ live on the agent side and arrive as plain tool arguments.
 
 ## Tools
 
-All tools return JSON. Every response carries a `status`: `ok`, `blocked`,
-`login-required`, `disabled` or `error`.
+All tools return JSON. Every response carries a `status`: `ok` (fresh live
+result), `cached` (stored result inside its freshness window), `cooldown`
+(stored result served while the source is blocked), `blocked` (source blocked,
+nothing stored), `login-required`, `disabled` or `error`. See
+[Persistent store, freshness and cooldowns](#persistent-store-freshness-and-cooldowns).
 
 | Tool | What it does |
 |---|---|
-| `search_marketplace(site, query, limit=20, sort="newest")` | Searches one configured source (first results page only) and returns listings. `sort` is `newest`, `relevance`, `price_asc` or `price_desc`, applied where the source supports it (`sort_applied` says whether it was). |
-| `fetch_listing(url)` | Fetches one listing page from a configured source and returns its fields. URLs of unconfigured sites are refused without a request. |
+| `search_marketplace(site, query, limit=20, sort="newest")` | Searches one configured source (first results page only) and returns listings. `sort` is `newest`, `relevance`, `price_asc` or `price_desc`, applied where the source supports it (`sort_applied` says whether it was). Served from the persistent store when the same search was made inside its freshness window or while the source is cooling down; a live request is made only otherwise. |
+| `fetch_listing(url)` | Fetches one listing page from a configured source and returns its fields. URLs of unconfigured sites are refused without a request. Served from the store inside its freshness window or during a cooldown. Only the URL the caller asked for is fetched; a search never fetches the listings it found. |
 | `list_sources()` | Lists the configured sources and their capabilities: search yes/no, dates reliable yes/no, login required yes/no. Sends no requests. |
-| `health(probe=true)` | Server status and per-source reachability: `reachable`, `blocked`, `login-required`, `disabled`, `unreachable` or `unknown`. With `probe=true` it sends at most one light request to each enabled source's home page (results are reused for 10 minutes, blocked sources are not contacted). With `probe=false` it reports the last known state and sends nothing. It never fetches listings. |
+| `health(probe=true)` | Server status, the persistent store's state (path, reachable, number of stored responses and active cooldowns; never the contents) and per-source reachability: `reachable`, `blocked`, `login-required`, `disabled`, `unreachable` or `unknown`. With `probe=true` it sends at most one light request to each enabled source's home page (results are reused for 10 minutes, blocked sources are not contacted). With `probe=false` it reports the last known state and sends nothing. It never fetches listings. |
 
-A blocked result looks like this; it contains no listings:
+### Persistent store, freshness and cooldowns
+
+The bridge makes as few live requests as possible and respects a source's
+"no". A small SQLite file (Python's standard `sqlite3`, no extra dependency)
+holds the latest response per *target* and the block cooldowns, and both
+survive restarts. On every search and fetch the store is checked **first**;
+a live request is the last resort.
+
+A **target** is one source plus one normalised query for `search_marketplace`,
+or one source plus one listing URL for `fetch_listing`:
+
+- Query normalisation: trim, collapse every run of whitespace to one space,
+  case-fold (Python `str.casefold()`). `"  Red   BIKE "` and `"red bike"` are
+  one target. Nothing else is changed. Because a different sort order is a
+  different results page, the stored target is `<sort>:<normalised query>`,
+  e.g. `newest:red bike`; the response reports it as `target`.
+- Listing URLs are normalised the way the fetcher already does (scheme
+  `https`, host lowercased without a trailing dot, fragment and credentials
+  dropped); the rebuilt URL is the target.
+
+What happens on a call:
+
+| Situation | Reply | Live request |
+|---|---|---|
+| Stored response younger than the freshness window | the stored response, `status: cached` | none |
+| Source in its block cooldown, a response is stored | the latest stored response, `status: cooldown` | none |
+| Source in its block cooldown, nothing stored | `status: blocked`, no listings | none |
+| Otherwise | one live request, `status: ok`, stored | one (shared by concurrent identical callers) |
+
+Freshness windows (defaults: searches 6 hours, listings 24 hours) are set with
+`PRICE_SCANNER_SEARCH_CACHE_TTL_SECONDS` and `PRICE_SCANNER_FETCH_CACHE_TTL_SECONDS`.
+The whole results page (up to the source's `max_results`) is stored, so a later
+call with a larger `limit` is served from the store too. The block cooldown is
+unchanged from v1 (one hour after a 403, 429, challenge page or CAPTCHA wall,
+per source, `cooldown_seconds` in the source config); it is now written to the
+store when it starts and restored at startup, so a restart cannot lift it.
+There is no retry, no prefetching, no background refresh and no automatic
+fetch of the listings a search returned.
+
+Fields added to every search and fetch response that involves a target (all
+v1 fields are unchanged):
+
+| Field | Meaning |
+|---|---|
+| `status` | `ok`, `cached`, `cooldown` or `blocked` (plus the v1 `login-required`, `disabled`, `error`) |
+| `from_cache` | `true` whenever the listings came from the store (or the short in-memory page cache), `false` for a live fetch |
+| `cached_at` | UTC time the stored response was fetched; `null` for a live result |
+| `age_seconds` | seconds since `cached_at`; `0` for a live result |
+| `next_refresh_at` | earliest UTC time a live request for this target can happen again: `cached_at` plus the freshness window, or the end of the cooldown, whichever is later; `null` on errors |
+| `cooldown_until` | UTC end of the source's block cooldown, or `null` |
+| `cooldown_remaining_seconds` | seconds left in the cooldown, `0` when none |
+| `cooldown_reason` | `http_403`, `http_429`, `challenge_page` ..., or `null` |
+| `target` | the normalised target that was looked up |
+| `retry_after_seconds` | (v1) kept on `blocked` and `cooldown` replies: equal to `cooldown_remaining_seconds` |
+
+A `cached` reply, fresh enough, next live check at `next_refresh_at`:
 
 ```json
-{"site": "allegro", "query": "road bike", "status": "blocked", "reason": "http_403",
- "retry_after_seconds": 3600, "listings": [], "count": 0}
+{"site": "olx", "query": "Gramofon", "sort": "newest", "target": "newest:gramofon",
+ "status": "cached", "from_cache": true,
+ "cached_at": "2026-10-25T11:40:12+00:00", "age_seconds": 905,
+ "next_refresh_at": "2026-10-25T17:40:12+00:00",
+ "cooldown_until": null, "cooldown_remaining_seconds": 0, "cooldown_reason": null,
+ "search_url": "https://www.example-market.test/search?q=gramofon", "sort_applied": true,
+ "dates_reliable": true, "fetched_at": "2026-10-25T11:40:12+00:00",
+ "listings": ["... as stored ..."], "count": 5}
 ```
+
+A `cooldown` reply, the source is blocked until `cooldown_until`, the latest
+stored listings are returned instead of a new request:
+
+```json
+{"site": "allegro", "query": "road bike", "sort": "newest", "target": "newest:road bike",
+ "status": "cooldown", "from_cache": true,
+ "cached_at": "2026-10-25T08:02:41+00:00", "age_seconds": 13051,
+ "cooldown_until": "2026-10-25T12:35:10+00:00", "cooldown_remaining_seconds": 2938,
+ "cooldown_reason": "http_403", "retry_after_seconds": 2938,
+ "next_refresh_at": "2026-10-25T12:35:10+00:00",
+ "search_url": "https://www.example-market.test/search?q=road+bike", "sort_applied": true,
+ "dates_reliable": false, "fetched_at": "2026-10-25T08:02:41+00:00",
+ "listings": ["... the latest stored listings ..."], "count": 12}
+```
+
+A `blocked` reply, the source is blocked and nothing is stored for the target;
+it contains no listings:
+
+```json
+{"site": "allegro", "query": "road bike", "sort": "newest", "target": "newest:road bike",
+ "status": "blocked", "reason": "http_403", "retry_after_seconds": 3600,
+ "from_cache": false, "cached_at": null, "age_seconds": 0,
+ "cooldown_until": "2026-10-25T12:35:10+00:00", "cooldown_remaining_seconds": 3600,
+ "cooldown_reason": "http_403", "next_refresh_at": "2026-10-25T12:35:10+00:00",
+ "search_url": "https://www.example-market.test/search?q=road+bike", "listings": [], "count": 0}
+```
+
+`health` reports the store without its contents, and `freshness_seconds`:
+
+```json
+{"status": "ok", "version": "0.2.0", "freshness_seconds": {"search": 21600, "fetch": 86400},
+ "store": {"path": "/opt/price-scanner/data/price-scanner.db", "reachable": true, "journal_mode": "wal",
+           "responses": 42, "active_cooldowns": 1, "write_failures": 0,
+           "consecutive_write_failures": 0, "degraded": false, "last_error": null},
+ "sources": ["..."]}
+```
+
+**The database file.** One SQLite file at `PRICE_SCANNER_DB_PATH`, created at
+startup with mode `600` (its parent directory is created with mode `700` when
+missing); WAL journal mode, a single writer. Keep it outside the repository
+(the shipped systemd unit uses `/opt/price-scanner/data/price-scanner.db`);
+`*.db*` and `data/` are git-ignored in case it is ever created inside. It
+holds only public listing data the tools already returned, UTC timestamps and
+cooldown state: no caller identity, no token, no history of who asked what.
+Stored responses are kept (one row per target, overwritten on refresh) so the
+latest one can be served during a cooldown; nothing prunes them yet.
+
+**Fail closed.** If the database cannot be opened at startup, `search_marketplace`
+and `fetch_listing` are refused with `status: error` and the reason is logged;
+there is no silent fall-back to unlimited in-memory fetching. `list_sources`
+and `health(probe=false)` keep working, and `health` reports
+`"status": "degraded"` with `store.reachable: false`. If a single write fails
+mid-run it is logged and counted (`store.write_failures`), the live result is
+still returned with a `store_warning`, and that target is simply fetched again
+next time. After three consecutive failed writes the store is `degraded`:
+stored responses are still served, but new live requests are refused until a
+write succeeds again (each refused call re-checks writability).
 
 ### Listing schema
 
@@ -110,6 +232,10 @@ sudo -u price-scanner -H bash -c '
 
 # 3. Chromium system libraries (as root)
 /opt/price-scanner/venv/bin/playwright install-deps chromium
+
+# 4. Directory for the persistent store, outside the repository (as root).
+#    The service creates the database file itself with mode 600.
+install -d -m 700 -o price-scanner -g price-scanner /opt/price-scanner/data
 ```
 
 `sudo` is used for brevity; `runuser -u price-scanner -- ...` works the same
@@ -143,7 +269,10 @@ Environment variables (see [`.env.example`](.env.example)):
 | `PRICE_SCANNER_CONFIG` | `config/sources.yaml` | Source config. If missing, the shipped example is used and a warning is logged. |
 | `PRICE_SCANNER_HEADLESS` | `true` | Run Chromium headless. |
 | `PRICE_SCANNER_LOG_LEVEL` | `INFO` | Log level. |
-| `PRICE_SCANNER_CACHE_TTL_SECONDS` | `300` | In-memory page cache lifetime. `0` disables it. |
+| `PRICE_SCANNER_CACHE_TTL_SECONDS` | `300` | In-memory page cache lifetime (a fast path in front of the fetcher). `0` disables it. |
+| `PRICE_SCANNER_DB_PATH` | `data/price-scanner.db` | The SQLite file for stored responses and cooldowns (mode 600, created at startup). Put it outside the repository; the shipped unit sets `/opt/price-scanner/data/price-scanner.db`. If it cannot be opened the server fails closed (search and fetch refused). |
+| `PRICE_SCANNER_SEARCH_CACHE_TTL_SECONDS` | `21600` (6 h) | Freshness window for search targets: the same source + normalised query is not fetched live again inside it. |
+| `PRICE_SCANNER_FETCH_CACHE_TTL_SECONDS` | `86400` (24 h) | Freshness window for listing targets (source + listing URL). |
 | `PRICE_SCANNER_ALLOWED_HOSTS` | unset | Extra `Host` header values to accept when a reverse proxy forwards requests, comma separated, e.g. `<your-host>.<your-tailnet>.ts.net`. |
 
 ### Adding a source
@@ -238,8 +367,18 @@ before any search. If a proxy forwards a different `Host` header, add it to
 - Chromium's default user agent; no fake identities. Images, media and fonts
   are not downloaded, which saves the sites bandwidth. The optional plain-HTTP
   mode (`fetch_mode: http`) uses curl_cffi presenting as a current Chrome.
-- Pages are cached in memory for a few minutes to avoid duplicate fetches
-  within one agent run. Nothing is stored on disk.
+- As few live requests as possible: the persistent store is checked before
+  any request; a target is fetched live at most once per freshness window
+  (6 h searches, 24 h listings by default); concurrent identical calls share
+  one request; nothing is prefetched or refreshed in the background, and a
+  search never fetches the listings it found. The short in-memory page cache
+  (minutes) stays as a fast path.
+- A block is final for the cooldown: no retry, no rotating user agents, IP
+  addresses or browser profiles, no headful or disguised browsing to get past
+  a challenge. The caller gets the latest stored response and the cooldown
+  status instead of fresh data.
+- On disk, only public listing data already returned, timestamps and cooldown
+  state (see the database file above). Nothing personal is stored.
 
 ## Login-gated sources
 
@@ -269,6 +408,9 @@ inside it.
   an empty body.
 - Logs pass through a redaction filter that removes the token, the profile
   path and any `Authorization`, `Cookie` or `Set-Cookie` values.
+- The persistent store holds no secrets and nothing personal: only public
+  listing data the tools already returned, UTC timestamps and cooldown state.
+  The file and its WAL/journal are mode 600 and git-ignored.
 
 ## SSRF protection
 
@@ -303,7 +445,10 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest
 ```
 
-The tests use synthetic HTML fixtures only and send no network requests.
+The tests use synthetic HTML fixtures and temporary database files only and
+send no network requests. `tests/test_store.py` counts live requests with a
+mock fetcher: a cached call makes zero, concurrent identical calls make at
+most one, a blocked call makes zero and is not retried.
 
 ## Release checklist
 
@@ -314,9 +459,13 @@ result (not the secrets) in the release notes:
 gitleaks git --redact -v .
 ```
 
-## Limitations (v1)
+## Limitations
 
 - First results page only; `limit` caps at the source's `max_results`.
+- Stored responses are never pruned (one row per target, overwritten on
+  refresh); the file grows with the number of distinct targets.
+- A source-wide cooldown: one block pauses every target of that source for
+  the cooldown, as in v1.
 - Site markup changes break selectors; an `ok` result with `count: 0` and a
   `note` usually means the layout changed.
 - Allegro selectors could not be verified while the site was blocking.

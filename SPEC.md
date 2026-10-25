@@ -27,9 +27,11 @@ See "Public-project rules" below — they are hard requirements, not guidance.
   CAPTCHA wall, or a 403/429, the tool reports `blocked` with the reason and
   stops. No aggressive retries, no CAPTCHA solving, no fingerprint spoofing
   beyond running a normal, up-to-date browser.
-- No notifications, no price-history database, no alerting in v1. The agent
-  that calls the tools owns all of that. (A storage extension is a later,
-  separate decision.)
+- No notifications, no price-history database, no alerting. The agent that
+  calls the tools owns all of that. v2 adds a persistent *response cache and
+  cooldown store* (see "Persistent store (v2)"); it is not a price history:
+  it keeps only the latest response per target, so the bridge can avoid
+  repeating live requests.
 
 ## Architecture
 
@@ -126,8 +128,74 @@ explicitly enables it and provides a browser profile (see Keys).
 - Identify with a normal desktop browser user agent (the Playwright default
   for the installed Chromium). No fake identities, no rotating user agents.
 - Cache nothing personal. Short-lived caching of fetched pages (minutes) is
-  allowed to avoid duplicate fetches within one agent run; no persistent
-  crawl database in v1.
+  allowed to avoid duplicate fetches within one agent run. Since v2 a
+  persistent store (below) keeps the latest response per target and the
+  cooldowns across restarts; it holds public listing data, timestamps and
+  cooldown state only. It is not a crawl database.
+
+## Persistent store (v2)
+
+Overriding principle: as few individual live requests as possible, and the
+sources are respected at all times. Every design choice that would increase
+the number of live requests (a shorter window, a retry, a background refresh)
+is decided the other way.
+
+- The store is checked first, on every `search_marketplace` and
+  `fetch_listing` call, before any live request. A live request is the last
+  resort.
+- A *target* is one source plus one normalised search query (trim, case-fold,
+  collapse whitespace; qualified by the requested sort order, since another
+  sort is another results page), or one source plus one listing URL
+  normalised as the fetcher normalises URLs.
+- Concurrent identical targets are coalesced into at most one live request.
+  One caller request never fans out into many live requests.
+- No prefetching, no speculative fetching, no automatic fetching of the
+  listings a search returned, no background refresh, no scheduled re-scan,
+  no cache warming.
+- No retry on a block, no immediate retry on a rate limit, no rotation of
+  user agents, IP addresses or browser profiles, no headful or disguised
+  browsing to evade a challenge. A block means: stop, cool down, serve the
+  stored response or the blocked status.
+- The per-site lock, the 2–5 s delay and the 10-minute health probe cache
+  from v1 stay as they are.
+
+Storage: one SQLite file (Python standard library `sqlite3`, no new
+dependency), operator-owned, mode 600, outside the repository, location
+`PRICE_SCANNER_DB_PATH`. WAL journal mode, a single writer. Two tables,
+created with `CREATE TABLE IF NOT EXISTS` at startup:
+
+- `responses`: source, kind (`search` | `fetch`), target, the response JSON
+  exactly as returned, `fetched_at` (UTC), the source's block state at that
+  time. One row per target, overwritten on refresh.
+- `cooldowns`: source, target (`*` = source-wide, the only kind v2 writes),
+  reason, `blocked_until` (UTC), `retry_after_seconds` at write time.
+
+Cooldown model: the v1 per-source block cooldown (one hour after a 403, 429,
+challenge page or CAPTCHA, from the timing config) is unchanged and is now
+persisted. Not-yet-expired cooldowns are loaded at startup and honoured
+before any fetch; expired ones are pruned at startup and on every write.
+
+Freshness window: after a successful live search or fetch the same target is
+not fetched live again until its window expires (defaults 6 hours for
+searches, 24 hours for listings; `PRICE_SCANNER_SEARCH_CACHE_TTL_SECONDS`,
+`PRICE_SCANNER_FETCH_CACHE_TTL_SECONDS`). Inside the window the stored
+response is served flagged `cached`.
+
+Reply contract (backward compatible; every v1 field is kept): `status` is
+`ok` (fresh live result), `cached` (stored, inside the window), `cooldown`
+(stored, served while the source is blocked) or `blocked` (blocked, nothing
+stored); plus `from_cache`, `cached_at`, `age_seconds`, `next_refresh_at`,
+`cooldown_until`, `cooldown_remaining_seconds`, `cooldown_reason` and
+`target`. `health` reports the store's path (never its contents), whether it
+is reachable, and the number of stored responses and active cooldowns.
+
+Failure behaviour: if the database cannot be opened at startup, search and
+fetch are refused with an error and the reason is logged; there is no silent
+fall-back to in-memory-only operation. `list_sources` and `health(probe=false)`
+keep working and `health` reports the store as down. A single failed write is
+logged and counted, the service does not crash, and the affected target is
+treated as uncached for that call only; after three consecutive failed writes
+new live requests are refused until a write succeeds again.
 
 ## Public-project rules (hard requirements)
 
@@ -158,7 +226,11 @@ nothing belonging to any individual operator.
     explicitly-enabled login-gated sources.
 - Ship `.env.example` containing **placeholder names only** (e.g.
   `PRICE_SCANNER_TOKEN=change-me-at-install`), and a `.gitignore` covering
-  `.env`, `*.session`, `profile/`, `auth/`, and any local config override.
+  `.env`, `*.session`, `profile/`, `auth/`, any local config override, and
+  the persistent store (`*.db`, its WAL/journal files, `data/`).
+- The persistent store never holds a secret or anything personal: no token,
+  no caller identity, no browser state. Public listing data, timestamps and
+  cooldown state only.
 - Token comparison must be constant-time. A missing or wrong token returns
   401 with no detail.
 - Logs must never print tokens, cookies, `Authorization`/`Set-Cookie`
@@ -198,6 +270,23 @@ nothing belonging to any individual operator.
       and the read-only boundary, using placeholders only.
 - [ ] LICENSE file present (operator chooses the license at release).
 - [ ] No buying, contacting, bidding, or account-action code exists in v1.
+
+## Acceptance (v2: persistent store)
+
+- [ ] A second identical search or fetch inside the freshness window returns
+      the stored response flagged `cached`, with `cached_at` and
+      `next_refresh_at`, and makes no live request.
+- [ ] Concurrent identical requests make at most one live request; no
+      prefetching, no automatic per-listing fetching after a search, no retry,
+      rotation or evasion after a block; proven by a test that counts live
+      requests.
+- [ ] A target in a blocked cooldown returns the latest stored response
+      flagged `cooldown` with `cooldown_until`, `cooldown_remaining_seconds`
+      and `cooldown_reason` and makes no live request; with nothing stored it
+      returns `blocked` with `retry_after_seconds` and no listings.
+- [ ] Cooldowns and stored responses survive a service restart.
+- [ ] If the database cannot be opened, search and fetch fail closed while
+      `list_sources` and `health` keep working.
 
 ## Out of scope for v1 (do not build)
 
